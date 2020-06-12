@@ -1,6 +1,9 @@
 a: Beatrix Potter
 t: The tale of Peter Rabbit
-g: adventure shortstories
+g: fantasy
+i: 6
+s: short-stories  adventure
+d:  October 1902
 BEGIN_CONTENT
 ONCE upon a time there were four little Rabbits, and their names were— Flopsy, Mopsy, Cotton-tail, and Peter.
 

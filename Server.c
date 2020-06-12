@@ -4,12 +4,17 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <mysql.h>
+#include <functional>
 #include <pthread.h>
+#include <math.h>
 #include <map>
 #include <unistd.h>
+#include <vector>
+#include <signal.h>
 #include <iostream>
 #include <stdio.h>
 #include <cstring>
+#include <algorithm>
 #include <string.h>
 #include <stdlib.h>
 #include <vector>
@@ -39,17 +44,35 @@ using namespace std;
 															else{	\
 																perror("[SERVER]: Connecting to Database ");return errno;}
 
-#define READ_CLIENT_CHECK(client,in,size)              		if(read(client,in,size)<0){perror("[SERVER]: Read error from client "); close (client); continue;}
-#define WRITE_CLIENT_CHECK(client,in,size)             		if(write(client,in,size)<0){perror("[SERVER]: Write error from client "); close (client); continue;}
+#define READ_CLIENT_CHECK(client,in,size)              		if(read(client,in,size)<0){perror("[SERVER]: Read error from client "); close (client); return(NULL);}
+#define WRITE_CLIENT_CHECK(client,in,size)             		if(write(client,in,size)<0){perror("[SERVER]: Write error from client "); close (client);}
 #define DATABASE_SERVER "localhost"
 #define DATABASE_USER "bookstore"
 #define DATABASE_PASSWORD "bookstore"
 #define DATABASE_USED "books"
+#define ROMANCE_ID 1
+#define FANTASY_ID 2
+#define SCIFI_ID 3
+#define THRILLER_ID 4
+#define MYSTERY_ID 5
+#define SATIRA_ID 6
+#define WEEK_LECTURE_ID  8
+#define K_CLOSEST_NUMBER 0.3
 typedef char BYTE;
 
-#define PORT 2222
+#define PORT 1928
 
 extern int errno;
+
+typedef struct thData{
+	int idThread;
+	int client;
+	MYSQL* dbConnect;
+}thData;
+
+
+int** userRating;
+
 class book{
 	private:
 	struct{
@@ -59,6 +82,9 @@ class book{
 	char* nickname;
 	char* author;
 	char* genres;
+	char* subgenres;
+	char * date;
+	int id;
 	}informations;
 	
 
@@ -75,6 +101,9 @@ class book{
 	char * getTitle()const {return this->informations.title;}
 	char * getAuthor()const {return this->informations.author;}
 	char * getGenres()const { return this->informations.genres;}
+	char * getSubGenre()const{ return this->informations.subgenres;}
+	char * getDate()const{ return this->informations.date;}
+	int getBookID() const { return this->informations.id;}
 	bool isNull(){return this->informations.isNull;}
 	void setIsNotNull(){
 		informations.isNull=0;
@@ -91,40 +120,216 @@ class book{
 	void setNickname( char * bookNickname){
 		informations.nickname=strdup(bookNickname);
 	}
-	void AddGenres( char * bookGenre){
+	void setGenres( char * bookGenre){
 		informations.genres=strdup(bookGenre);
 	}
+	void setSubGenres( char * bookSubGenre){
+		informations.subgenres=strdup(bookSubGenre);
+	}
+	void setDate( char * bookDate){
+		informations.date=strdup(bookDate);
+	}
+	void setBookID(int id){
+		informations.id=id;
+	}
+	
+
 
 
 };
-int addUserToDB(MYSQL * dbConnect, const char * username){
+bool sortInRev(const pair<double,int> &a,  const pair<double,int> &b) { 
+       return (a.first > b.first); 
+} 
+int castBookGenres(string genres){
+	if(strstr(genres.c_str(),"romance")||strstr(genres.c_str(),"Romance"))
+		return ROMANCE_ID;
+	if(strstr(genres.c_str(),"fantasy")||strstr(genres.c_str(),"Fantasy"))
+		return FANTASY_ID;
+	if(strstr(genres.c_str(),"mystery")||strstr(genres.c_str(),"Mystery"))
+		return MYSTERY_ID;
+	if(strstr(genres.c_str(),"thriller")||strstr(genres.c_str(),"Thriller"))
+		return THRILLER_ID;
+	if(strstr(genres.c_str(),"sci-fi")||strstr(genres.c_str(),"Sci-Fi")||strstr(genres.c_str(),"Sci-fi"))
+		return SCIFI_ID;
+	if(strstr(genres.c_str(),"satira")||strstr(genres.c_str(),"Satira"))
+		return SATIRA_ID;
+}
+void populateRatingTable(MYSQL* dbConnect,int userNumber,int bookNumber,int ** userRating){
+
+	for(int i=0;i<=userNumber;i++)
+		for(int j=0;j<=bookNumber;j++)
+			userRating[i][j]=0;
+	
+	MYSQL_RES *res_set;
+	MYSQL_ROW row;
+	mysql_query (dbConnect,"select user_id,book_id,stars from rating;");
+	res_set = mysql_store_result(dbConnect);
+	unsigned int numrows = mysql_num_rows(res_set);
+	while (((row= mysql_fetch_row(res_set)) !=NULL )){
+		int i=atoi(row[0]);
+		int j=atoi(row[1]);
+		int stars=atoi(row[2]);
+
+		userRating[i][j]=stars;
+
+	}
+
+
+}
+double cosine_similarity(int *A, int *B, unsigned int Vector_Length){
+    double dot = 0.0, denom_a = 0.0, denom_b = 0.0 ;
+     for(unsigned int i = 0u; i < Vector_Length; ++i) {
+        dot += A[i] * B[i] ;
+        denom_a += A[i] * A[i] ;
+        denom_b += B[i] * B[i] ;
+    }
+	if(denom_a==0||denom_b==0)
+		return 0;
+
+    return dot / (sqrt(denom_a) * sqrt(denom_b)) ;
+}
+void userRatingCosine(int userID,int userNumber,int bookNumber,char * MYSQLcommand,MYSQL * dbConnect){
+	int ** userRating= (int**) malloc((userNumber+1)*sizeof(int*));
+	for (int i = 0; i <= userNumber; ++i)
+    	userRating[i] = (int*) malloc((bookNumber+1)*sizeof(int));
+
+
+	populateRatingTable(dbConnect,userNumber,bookNumber,userRating);
+	 vector<pair<double,int>> neighbors;
+	 vector<pair<double,int>> bookToSuggest;
+
+	for(int i=1;i<=userNumber;i++){
+		if(i!=userID){
+		double similarities=cosine_similarity(userRating[userID],userRating[i],bookNumber);
+		if(similarities>0)
+			neighbors.push_back(pair<double,int>(similarities,i));
+		}
+	}
+	if(neighbors.size()>0){
+
+		sort(neighbors.begin(),neighbors.end(), sortInRev);
+
+
+		for(int j=1;j<=bookNumber;j++){
+			double score=0;
+			int count=0;
+
+			int maxNeighbors=K_CLOSEST_NUMBER*neighbors.size();
+			if(maxNeighbors<=2){
+				maxNeighbors=neighbors.size();
+			}
+
+			for(int i=0;i<maxNeighbors;i++){
+				if(userRating[neighbors[i].second][j]!=0){
+					score+=userRating[neighbors[i].second][j];
+					count++;
+				}
+			}
+			if(count>0){
+				score=score/count;
+				bookToSuggest.push_back(pair<double,int>(score,j));
+			}
+		}
+		if(bookToSuggest.size()>0){
+			sort(bookToSuggest.begin(),bookToSuggest.end(),sortInRev);
+			sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors where id=%d and id not in (select id_book  from book_owned where id=%d ) order by rand() limit 1;",bookToSuggest[0].second,userID);
+		}
+		
+	}
+	else{
+		sprintf(MYSQLcommand,"select");
+	}
+	for (int i = 0; i <= userNumber; ++i)
+    	free(userRating[i]);
+	free(userRating);	
+
+		
+
+}
+int booksInDB(MYSQL* dbConnect){
+	int number=0;
+	MYSQL_RES *res_set;
+	MYSQL_ROW row;
+	mysql_query (dbConnect,"select AUTO_INCREMENT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='books' AND TABLE_NAME='all_books';");
+	res_set = mysql_store_result(dbConnect);
+	row=mysql_fetch_row(res_set);
+	number=atoi(row[0])-1;
+	return number;
+}
+int userInDB(MYSQL* dbConnect){
+	int number=0;
+	MYSQL_RES *res_set;
+	MYSQL_ROW row;
+	mysql_query (dbConnect,"select AUTO_INCREMENT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='books' AND TABLE_NAME='users';");
+	res_set = mysql_store_result(dbConnect);
+	row=mysql_fetch_row(res_set);
+	number=atoi(row[0])-1;
+	return number;
+}
+void addStarsToDB(MYSQL* dbConnect,const char * title,int stars,int userID){
+
+	int starScore=stars;
+	int book_id;
+	MYSQL_RES *res_set;
+	MYSQL_ROW row;
+	mysql_query (dbConnect,"select id,title,stars from all_books;");
+	unsigned int i =1;
+	res_set = mysql_store_result(dbConnect);
+	unsigned int numrows = mysql_num_rows(res_set);
+	while (((row= mysql_fetch_row(res_set)) !=NULL )){
+ 		if(strcmp(row[i],title)==0){
+			 if(row[i+1]!=NULL){
+			 	starScore+=atoi(row[i+1]);
+				starScore/=2;
+
+				book_id=atoi(row[0]);
+			 }
+		 }
+	}
+	char MYSQLcommand[1000];
+	sprintf(MYSQLcommand,"update all_books set stars=%d where title=\"%s\" ;",starScore,title);
+	mysql_query (dbConnect,MYSQLcommand);
+
+	sprintf(MYSQLcommand,"insert into rating(book_id,user_id,stars) VALUES ( %d, %d, %d) ",book_id,userID,stars);
+	mysql_query (dbConnect,MYSQLcommand);
+}
+int addUserToDB(MYSQL * dbConnect, const char * username,const char * password){
+
+	string userPass(password);
+	int userHashedPass=hash<string>{}(userPass);
 
 	MYSQL_RES *res_set;	
 	MYSQL_ROW row;
-	mysql_query (dbConnect,"select id,username from users;");
+
+	char MYSQLcommand[1000];
+	sprintf(MYSQLcommand,"insert into users (username,password) VALUES (\"%s\",\"%d\");",username,userHashedPass);
+	mysql_query (dbConnect,MYSQLcommand);
+
+	mysql_query (dbConnect,"select id,username,password from users;");
+	int i =0;
+	res_set = mysql_store_result(dbConnect);
+	int numrows = mysql_num_rows(res_set);
+	while (((row= mysql_fetch_row(res_set)) !=NULL )){
+ 		if(strcmp(row[i+1],username)==0){
+			 return atoi(row[i]);
+		 }
+	}
+	return 0;
+}
+int logUserToDB(MYSQL * dbConnect, const char * username,const char * password){
+	string userPass(password);
+	int userHashedPass=hash<string>{}(userPass);
+	MYSQL_RES *res_set;	
+	MYSQL_ROW row;
+	mysql_query (dbConnect,"select id,username,password from users;");
 	unsigned int i =0;
 	res_set = mysql_store_result(dbConnect);
 	unsigned int numrows = mysql_num_rows(res_set);
 	while (((row= mysql_fetch_row(res_set)) !=NULL )){
- 		if(strcmp(row[i+1],username)==0){
+ 		if(strcmp(row[i+1],username)==0&&(atoi(row[i+2])==userHashedPass)){\
 			 return atoi(row[i]);
 		 }
 	}
-	char MYSQLcommand[1000];
-	sprintf(MYSQLcommand,"insert into users (username) VALUES (\"%s\");",username);
-	mysql_query (dbConnect,MYSQLcommand);
-
-	mysql_query (dbConnect,"select id,username from users;");
-	i =0;
-	res_set = mysql_store_result(dbConnect);
-	numrows = mysql_num_rows(res_set);
-	while (((row= mysql_fetch_row(res_set)) !=NULL )){
- 		if(strcmp(row[i+1],username)==0){
-			 return atoi(row[i]);
-		 }
-	}
-
-	
 	return 0;
 }
 void updateUserPreferences(MYSQL* dbConnect,int userID){
@@ -167,7 +372,6 @@ void updateUserPreferences(MYSQL* dbConnect,int userID){
 			max2.str=x.first;
 		}
 	}
-	printf("%s %s %d\n",max1.str.c_str(),max2.str.c_str(),userID);
 	sprintf(MYSQLcommand,"update users set fst_fav_author=\'%s\' where id=%d;",max1.str.c_str(),userID);
 	mysql_query (dbConnect,MYSQLcommand);
 	if(!max2.str.empty()){
@@ -190,7 +394,6 @@ void updateUserPreferences(MYSQL* dbConnect,int userID){
 			max2.str=x.first;
 		}
 	}
-	printf("%s %s %d\n",max1.str.c_str(),max2.str.c_str(),userID);
 	sprintf(MYSQLcommand,"update users set fst_fav_genre=\'%s\' where id=%d;",max1.str.c_str(),userID);
 	mysql_query (dbConnect,MYSQLcommand);
 	if(!max2.str.empty()){
@@ -200,9 +403,9 @@ void updateUserPreferences(MYSQL* dbConnect,int userID){
 
 }
 void addBookToUser(MYSQL * dbConnect,int userID,book& bookIN){
-	char MYSQLcommand[1000];
-	sprintf(MYSQLcommand,"insert into book_owned (id,book_name,author_name,genre) VALUES (%d,\"%s\",\"%s\",\"%s\");",
-	userID,bookIN.getTitle(),bookIN.getAuthor(),bookIN.getGenres());
+	char MYSQLcommand[2000];
+	sprintf(MYSQLcommand,"insert into book_owned (id,book_name,author_name,genre,id_book) VALUES (%d,\"%s\",\"%s\",\"%s\",%d);",
+	userID,bookIN.getTitle(),bookIN.getAuthor(),bookIN.getGenres(),bookIN.getBookID());
 	int error=mysql_query (dbConnect,MYSQLcommand);
 	if(error==0){
 		updateUserPreferences(dbConnect,userID);
@@ -234,18 +437,32 @@ void parseBookInfos(char* location,book &bookIN){
 					break;
 				}
 					
-				case 'n':{
-					char nickname[100];
-					strcpy(nickname,line+3);
-					nickname[strlen(nickname)-1]='\0';
-					bookIN.setNickname(nickname);
+				case 'i':{
+					char id[100];
+					strcpy(id,line+3);
+					id[strlen(id)-1]='\0';
+					bookIN.setBookID(atoi(id));
 					break;
 				}
 				case 'g':{
 					char genre[500];
 					strcpy(genre,line+3);
 					genre[strlen(genre)-1]='\0';
-					bookIN.AddGenres(genre);
+					bookIN.setGenres(genre);
+					break;
+				}
+				case 's':{
+					char subgenre[500];
+					strcpy(subgenre,line+3);
+					subgenre[strlen(subgenre)-1]='\0';
+					bookIN.setSubGenres(subgenre);
+					break;
+				}
+				case 'd':{
+					char date[500];
+					strcpy(date,line+3);
+					date[strlen(date)-1]='\0';
+					bookIN.setDate(date);
 					break;
 				}
 				case 'B':{
@@ -308,13 +525,37 @@ book  searchBookByTitle(const char * path ,const char * titleToSearch){
 	return bookSearch;
 
 }
-void suggestionDBquerys(MYSQL * dbConnect, int client, const char * query){
+void suggestionDBquerys(MYSQL * dbConnect, int client, const char * query,int userID){
 	MYSQL_RES *res_set;	
 	MYSQL_ROW row;
 	int error=mysql_query (dbConnect,query);
 	if(error==0){
 		unsigned int i =0;
 		res_set = mysql_store_result(dbConnect);
+		unsigned int numrows = mysql_num_rows(res_set);
+		WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
+		while (((row= mysql_fetch_row(res_set)) !=NULL )){
+			int firstRowSize,secondRowSize,thirdRowSize;
+			if(row[i]!=NULL)
+				firstRowSize=strlen(row[i]);
+			WRITE_INSIDE_FUNC_CHECK(client,&firstRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i],firstRowSize);
+			if(row[i+1]!=NULL)
+				secondRowSize=strlen(row[i+1]);
+			WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+			if(row[i+2]!=NULL)
+				thirdRowSize=strlen(row[i+2]);
+			WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i+2],thirdRowSize);
+		}
+	}
+	else{
+		char command[500];
+		sprintf(command,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors where id not in (select id_book from book_owned where id=%d) order by rand() limit 1",userID);
+		mysql_query (dbConnect,command);
+		res_set = mysql_store_result(dbConnect);
+		int i=0;
 		unsigned int numrows = mysql_num_rows(res_set);
 		WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
 		while (((row= mysql_fetch_row(res_set)) !=NULL )){
@@ -325,19 +566,26 @@ void suggestionDBquerys(MYSQL * dbConnect, int client, const char * query){
 			int secondRowSize=strlen(row[i+1]);
 			WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
 			WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+
+			int thirdRowSize=strlen(row[i+2]);
+			WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i+2],thirdRowSize);
 		}
-	}
-	else{
-		unsigned int numrows=0;
-		WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
 	}
 	
 	
 }
+void weekSuggestedlecture(MYSQL* dbConnect,int client,int userID){
+	char query[200];
+	sprintf(query,"select title,name,genre_name from all_books left join all_genres on all_books.genre=all_genres.id_genre natural join authors  where id=%d;",WEEK_LECTURE_ID);
+	suggestionDBquerys(dbConnect,client,query,userID);
+	
+}
 void browseAll(MYSQL* dbConnect,int client){
+
 	MYSQL_RES *res_set;	
 	MYSQL_ROW row;
-	mysql_query (dbConnect,"select title,author from all_books;");
+	mysql_query (dbConnect,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors;");
 	unsigned int i =0;
 	res_set = mysql_store_result(dbConnect);
 	unsigned int numrows = mysql_num_rows(res_set);
@@ -346,11 +594,15 @@ void browseAll(MYSQL* dbConnect,int client){
 		int firstRowSize=strlen(row[i]);
 		WRITE_INSIDE_FUNC_CHECK(client,&firstRowSize,sizeof(int));
 		WRITE_INSIDE_FUNC_CHECK(client,row[i],firstRowSize);
-
 		int secondRowSize=strlen(row[i+1]);
 		WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
 		WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+		int thirdRowSize=strlen(row[i+2]);
+		WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+		WRITE_INSIDE_FUNC_CHECK(client,row[i+2],thirdRowSize);
+
 	}
+	mysql_free_result(res_set); 
 	
 
 }
@@ -359,22 +611,60 @@ void browseByAuthor(MYSQL* dbConnect, int client,const char * author){
 	MYSQL_RES *res_set;	
 	MYSQL_ROW row;
 
-	char MYSQLcommand[1000];
-	sprintf(MYSQLcommand,"select title,author from all_books where author=\"%s\";",author);
-	mysql_query (dbConnect,MYSQLcommand);
-	unsigned int i =0;
+
+
+	char MYSQLcommand[2000];
+	sprintf(MYSQLcommand,"select name,description,genres,subgenres from authors where name=\"%s\";",author);
+	int errors=mysql_query (dbConnect,MYSQLcommand);
+
 	res_set = mysql_store_result(dbConnect);
 	unsigned int numrows = mysql_num_rows(res_set);
-	WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
-	while (((row= mysql_fetch_row(res_set)) !=NULL )){
-		int firstRowSize=strlen(row[i]);
-		WRITE_INSIDE_FUNC_CHECK(client,&firstRowSize,sizeof(int));
-		WRITE_INSIDE_FUNC_CHECK(client,row[i],firstRowSize);
+	row= mysql_fetch_row(res_set);
 
-		int secondRowSize=strlen(row[i+1]);
+	WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
+	
+	if(row!=NULL){
+		int firstRowSize=strlen(row[0]);
+		WRITE_INSIDE_FUNC_CHECK(client,&firstRowSize,sizeof(int));
+		WRITE_INSIDE_FUNC_CHECK(client,row[0],firstRowSize);
+
+		int secondRowSize=strlen(row[1]);
 		WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
-		WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+		WRITE_INSIDE_FUNC_CHECK(client,row[1],secondRowSize);
+
+		int thirdRowSize=strlen(row[2]);
+		WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+		WRITE_INSIDE_FUNC_CHECK(client,row[2],thirdRowSize);
+
+		int fourthRowSize=strlen(row[3]);
+		WRITE_INSIDE_FUNC_CHECK(client,&fourthRowSize,sizeof(int));
+		WRITE_INSIDE_FUNC_CHECK(client,row[3],fourthRowSize);
+
+
+
+		sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors where name=\"%s\";",author);
+		mysql_query (dbConnect,MYSQLcommand);
+		unsigned int i =0;
+		res_set = mysql_store_result(dbConnect);
+		numrows = mysql_num_rows(res_set);
+		WRITE_INSIDE_FUNC_CHECK(client,&numrows,sizeof(int));
+		while (((row= mysql_fetch_row(res_set)) !=NULL )){
+			int firstRowSize=strlen(row[i]);
+			WRITE_INSIDE_FUNC_CHECK(client,&firstRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i],firstRowSize);
+
+			int secondRowSize=strlen(row[i+1]);
+			WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+
+			int thirdRowSize=strlen(row[i+2]);
+			WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+			WRITE_INSIDE_FUNC_CHECK(client,row[i+2],thirdRowSize);
+		}
 	}
+
+
+	
 }
 
 void browseByGenre(MYSQL* dbConnect, int client,const char * genre){
@@ -382,7 +672,7 @@ void browseByGenre(MYSQL* dbConnect, int client,const char * genre){
 	MYSQL_ROW row;
 
 	char MYSQLcommand[1000];
-	sprintf(MYSQLcommand,"select title,author from %s left join all_books on %s.id=all_books.id;",genre,genre);
+	sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors where genre_name=\"%s\";",genre);
 	int error=mysql_query (dbConnect,MYSQLcommand);
 	if(error==0){
 	unsigned int i =0;
@@ -398,6 +688,10 @@ void browseByGenre(MYSQL* dbConnect, int client,const char * genre){
 		int secondRowSize=strlen(row[i+1]);
 		WRITE_INSIDE_FUNC_CHECK(client,&secondRowSize,sizeof(int));
 		WRITE_INSIDE_FUNC_CHECK(client,row[i+1],secondRowSize);
+
+		int thirdRowSize=strlen(row[i+2]);
+		WRITE_INSIDE_FUNC_CHECK(client,&thirdRowSize,sizeof(int));
+		WRITE_INSIDE_FUNC_CHECK(client,row[i+2],thirdRowSize);
 	}
 
 	}
@@ -407,11 +701,260 @@ void browseByGenre(MYSQL* dbConnect, int client,const char * genre){
 	}
 }
 
+void * CLIENT_CMD(void* arg){
+
+	thData ThreadData; 
+	ThreadData= *((struct thData*)arg);
+
+	MYSQL * dbConnect=ThreadData.dbConnect;
+	int client=ThreadData.client;
+	int ThreadIndex=ThreadData.idThread;
+
+	int usernameSize,passwordSize,userID=0;
+
+	while(userID==0){//Login and register part
+
+		BYTE loginOrregister;
+
+		READ_CLIENT_CHECK(client,&loginOrregister,sizeof(BYTE));
+
+		READ_CLIENT_CHECK(client,&usernameSize,sizeof(int));
+		char * username=(char*)malloc(usernameSize*sizeof(char));
+		READ_CLIENT_CHECK(client,username,usernameSize);
+
+		READ_CLIENT_CHECK(client,&passwordSize,sizeof(int));
+		char * password=(char*)malloc(passwordSize*sizeof(char));
+		READ_CLIENT_CHECK(client,password,passwordSize);
+
+		if(loginOrregister==1){
+			userID=logUserToDB(dbConnect,username,password);
+		}
+		else{
+			userID=addUserToDB(dbConnect,username,password);
+		}
+		WRITE_CLIENT_CHECK(client,&userID,sizeof(int));
+		free(username);
+		free(password);
+
+
+	}
+	
+
+    int pid; 
+	bool EXIT=false;
+	while(!EXIT){
+		BYTE typeOfCommand;
+    	READ_CLIENT_CHECK(client,&typeOfCommand,sizeof(BYTE));
+		switch(typeOfCommand){
+					case 0: {/*EXIT*/
+						printf("[SERVER]: CLIENT EXIT\n");
+						EXIT=true;
+						break;
+					}
+					case 1: {/*Search and Download by title*/
+						
+						int titleSize;
+						READ_CLIENT_CHECK(client,&titleSize,sizeof(int));
+						char * titleToSearch=(char*)malloc(titleSize*sizeof(char));
+						READ_CLIENT_CHECK(client,titleToSearch,titleSize);
+						titleToSearch[titleSize]='\0';
+
+						book clientBook=searchBookByTitle("BOOKS",titleToSearch);
+						if(clientBook.isNull()){
+							BYTE foundFlag=0;
+							WRITE_CLIENT_CHECK(client,&foundFlag,sizeof(BYTE));
+
+						}
+						else{
+							BYTE foundFlag=1;
+							WRITE_CLIENT_CHECK(client,&foundFlag,sizeof(BYTE));
+
+							char infoMsg[2000];
+							
+
+							sprintf(infoMsg,"Title: %s\nAuthor: %s\nGenres: %s\nSubgenres: %s\nDate:%s\nExcelent Choice!\n",clientBook.getTitle(),
+									clientBook.getAuthor(),clientBook.getGenres(),clientBook.getSubGenre(),clientBook.getDate());
+
+							int msgSize=strlen(infoMsg);
+
+							WRITE_CLIENT_CHECK(client,&msgSize,sizeof(int));
+							WRITE_CLIENT_CHECK(client,infoMsg,msgSize);
+							
+							BYTE downloadFlag;
+							READ_CLIENT_CHECK(client,&downloadFlag,sizeof(BYTE));
+							if(downloadFlag==1){
+							
+								TransferBookContenent(clientBook.getLocation(),clientBook,client);
+								addBookToUser(dbConnect,userID,clientBook);
+							}
+
+
+						}
+						free(titleToSearch);
+
+						break;
+					}
+					case 2:{/*BROWSE all or by genre,author*/
+
+						int browseSize;
+						READ_CLIENT_CHECK(client,&browseSize,sizeof(int));
+						char * browseType=(char*)malloc((browseSize+1)*sizeof(char));
+						READ_CLIENT_CHECK(client,browseType,browseSize);
+						browseType[browseSize]=0;
+
+						if(strcmp(browseType,"all")==0){
+							browseAll(dbConnect,client);
+						}
+						else
+						if(strcmp(browseType,"genre")==0){
+
+
+							int genreSize;
+							READ_CLIENT_CHECK(client,&genreSize,sizeof(int));
+							char * genre=(char*)malloc((genreSize+1)*sizeof(char));
+							READ_CLIENT_CHECK(client,genre,genreSize);
+							genre[genreSize]='\0';
+
+							browseByGenre(dbConnect,client,genre);
+							free(genre);
+
+						}
+						else
+						if(strcmp(browseType,"author")==0){
+
+							int authorSize;
+							READ_CLIENT_CHECK(client,&authorSize,sizeof(int));
+							char * author=(char*)malloc((authorSize+1)*sizeof(char));
+							READ_CLIENT_CHECK(client,author,authorSize);
+							author[authorSize]='\0';
+
+
+							browseByAuthor(dbConnect,client,author);
+							free(author);
+						}
+
+						free(browseType);
+						break;
+					}
+					case 3:{//SUGGEST
+						//first based on prevoius genre
+						BYTE hasPreviousBooks=1;
+						MYSQL_RES *res_set;	
+						MYSQL_ROW row;
+						
+						char MYSQLcommand[2000];
+						sprintf(MYSQLcommand,"select fst_fav_author,scd_fav_author,fst_fav_genre,scd_fav_genre from users where id=%d ;",userID);
+						mysql_query (dbConnect,MYSQLcommand);
+						
+						res_set = mysql_store_result(dbConnect);
+						row= mysql_fetch_row(res_set);
+						if(row[0]==NULL){
+							hasPreviousBooks=0;
+						}
+
+						WRITE_CLIENT_CHECK(client,&hasPreviousBooks,sizeof(BYTE));
+
+						weekSuggestedlecture(dbConnect,client,userID);//SUGGEST THE WEEK LECTURE
+
+
+
+						if(hasPreviousBooks==1){
+							char  rowchar[300];
+							string firstAuthor;
+							string secondAuthor;
+							string firstGenre;
+							string secondGenre;
+							if(row[0]!=NULL){
+								sprintf(rowchar,"%s",row[0]);
+								firstAuthor=rowchar;
+							}
+							if(row[1]!=NULL){
+								sprintf(rowchar,"%s",row[1]);
+								secondAuthor=rowchar;
+							}
+							if(row[2]!=NULL){
+								sprintf(rowchar,"%s",row[2]);
+								firstGenre=rowchar;
+							}
+							if(row[3]!=NULL){
+								sprintf(rowchar,"%s",row[3]);
+								secondGenre=rowchar;
+							}
+
+							int firstGenreID=castBookGenres(firstGenre);
+							int secondGenreID=castBookGenres(secondGenre);
+				
+							srand(time(0));
+							double probability=(double)rand() / (double)RAND_MAX;
+
+							if(probability>=0.6){//BASED ON RATING-COSINE-SIMILIRATY
+								int userNumber=userInDB(dbConnect);
+								int bookNumber=booksInDB(dbConnect);
+								sprintf(MYSQLcommand,"ala bala");
+								userRatingCosine(userID, userNumber, bookNumber,MYSQLcommand,dbConnect);
+							}
+							else if(probability>=0.3){//BASED ON USER WITH SAME GENRE AND AUTHOR PREFERENCES
+								sprintf(MYSQLcommand,"select book_name,author_name,genre from book_owned left join users on users.id=book_owned.id  where users.id!=%d and (fst_fav_author = \"%s\" or fst_fav_genre = \"%s\" or scd_fav_author= \"%s\" or scd_fav_genre= \"%s\")  and id_book not in (select id_book from book_owned where id=%d) order by rand() limit 1;",
+									userID,firstAuthor.c_str(),firstGenre.c_str(),firstAuthor.c_str(),firstGenre.c_str(),userID);
+
+							}
+							else if(probability>=0.1){//BASED ON AUTHOR PREFERENCES
+								if((double)rand() / (double)RAND_MAX  > 0.3||secondAuthor.empty())
+									sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on all_books.genre=all_genres.id_genre natural join authors where name=\"%s\" and id not in (select id_book from book_owned where id=%d ) order by rand() limit 1;",firstAuthor.c_str(),userID);
+								else
+									sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on all_books.genre=all_genres.id_genre natural join authors where name=\"%s\" and id not in (select id_book  from book_owned where id=%d ) order by rand() limit 1;",secondAuthor.c_str(),userID);
+						
+							}
+							else{//BASED ON GENRE PREFERENCES
+								if((double)rand() / (double)RAND_MAX  > 0.3||secondGenre.empty())
+									sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on all_books.genre=all_genres.id_genre natural join authors where id_genre=%d and id not in (select id_book from book_owned where id=%d ) order by rand() limit 1;",firstGenreID,userID);
+								else
+									sprintf(MYSQLcommand,"select title,name,genre_name from all_books left join all_genres on all_books.genre=all_genres.id_genre natural join authors where id_genre=%d and id not in (select id_book from book_owned where id=%d ) order by rand() limit 1;",secondGenreID,userID);
+							}	
+							suggestionDBquerys(dbConnect,client,MYSQLcommand,userID);
+
+						}
+						
+						suggestionDBquerys(dbConnect,client,"select title,name,genre_name from all_books left join all_genres on genre=id_genre natural join authors where stars=(select MAX(stars) from all_books);",userID); //SUGGESTION based on stars
+						break;
+
+						
+					}
+					case 4: {//RATE
+						BYTE errorFlag;
+						READ_CLIENT_CHECK(client,&errorFlag,sizeof(BYTE));
+						if(errorFlag==1)
+							break;
+
+						int titleSize;
+						READ_CLIENT_CHECK(client,&titleSize,sizeof(int));
+						char * title=(char*)malloc(titleSize*sizeof(char));
+						READ_CLIENT_CHECK(client,title,titleSize);
+						title[titleSize]='\0';
+						
+						int stars;
+						READ_CLIENT_CHECK(client,&stars,sizeof(int));
+						addStarsToDB(dbConnect,title,stars,userID);
+
+
+						free(title);
+						break;
+					}
+			}
+
+
+		}
+    close (client);
+}
 
 int main ()
 {	
+	thData* ThreadData;
+	int ThreadIndex=0;
+
 	MYSQL* dbConnect;
 	CONNECT_TO_DATABASE_CHECK(dbConnect);
+
 
     struct sockaddr_in server;
     struct sockaddr_in from;
@@ -438,165 +981,22 @@ int main ()
     	socklen_t length = sizeof (from);
 
 		ACCEPT_CHECK(client,serverDescriptor,from,length);
-		perror("[SERVER]: ACCEPT");
-		
+		perror("[SERVER]: ACCEPT");			
+	
 
-		int usernameSize,userID;
-		READ_CLIENT_CHECK(client,&usernameSize,sizeof(int));
-		char * username=(char*)malloc(usernameSize*sizeof(char));
-		READ_CLIENT_CHECK(client,username,usernameSize);
-		userID=addUserToDB(dbConnect,username);
-		
-		free(username);
-
-    	int pid;
-
-		FORK_CHECK(pid);
-    	if (pid > 0) {
-    		close(client);
-    		while(waitpid(-1,NULL,WNOHANG));
-    		continue;
-    	} 
-		else if (pid == 0) {
-			bool EXIT=false;
-    		close(serverDescriptor);
-			while(!EXIT){
-				BYTE typeOfCommand;
-    			READ_CLIENT_CHECK(client,&typeOfCommand,sizeof(BYTE));
-				switch(typeOfCommand){
-					case 0: {/*EXIT*/
-						printf("[SERVER]: CLIENT EXIT\n");
-						EXIT=true;
-						break;
-					}
-					case 1: {/*Search and Download by title*/
-						
-						int titleSize;
-						READ_CLIENT_CHECK(client,&titleSize,sizeof(int));
-						char * titleToSearch=(char*)malloc(titleSize*sizeof(char));
-						READ_CLIENT_CHECK(client,titleToSearch,titleSize);
-						titleToSearch[titleSize]='\0';
-
-						book clientBook=searchBookByTitle("BOOKS",titleToSearch);
-						if(clientBook.isNull()){
-							BYTE foundFlag=0;
-							WRITE_CLIENT_CHECK(client,&foundFlag,sizeof(BYTE));
-
-						}
-						else{
-							BYTE foundFlag=1;
-							WRITE_CLIENT_CHECK(client,&foundFlag,sizeof(BYTE));
-
-							char infoMsg[1000];
-							
-
-							sprintf(infoMsg,"Title: %s\nAuthor: %s\nGenres: %s\n\nExcelent Choice!\n",clientBook.getTitle(),
-									clientBook.getAuthor(),clientBook.getGenres());
-
-							int msgSize=strlen(infoMsg);
-
-							WRITE_CLIENT_CHECK(client,&msgSize,sizeof(int));
-							WRITE_CLIENT_CHECK(client,infoMsg,msgSize);
-							
-							BYTE downloadFlag;
-							READ_CLIENT_CHECK(client,&downloadFlag,sizeof(BYTE));
-							if(downloadFlag==1){
-							
-								TransferBookContenent(clientBook.getLocation(),clientBook,client);
-								addBookToUser(dbConnect,userID,clientBook);
-							}
+		ThreadData=(struct thData*)malloc(sizeof(struct thData));
+		ThreadData->idThread=ThreadIndex++;
+		ThreadData->client=client;
+		ThreadData->dbConnect=dbConnect;
 
 
-						}
-						free(titleToSearch);
 
-						break;
-					}
-					case 2:{/*BROWSE all or by genre,author*/
+		pthread_t CLIENT_COMMANDS_THREAD;
+		pthread_create(&CLIENT_COMMANDS_THREAD, NULL, CLIENT_CMD, ThreadData);
 
-						int browseSize;
-						READ_CLIENT_CHECK(client,&browseSize,sizeof(int));
-						char * browseType=(char*)malloc(browseSize*sizeof(char));
-						READ_CLIENT_CHECK(client,browseType,browseSize);
-						browseType[browseSize]=0;
-
-						if(strcmp(browseType,"all")==0){
-							browseAll(dbConnect,client);
-						}
-						else
-						if(strcmp(browseType,"genre")==0){
-
-
-							int genreSize;
-							READ_CLIENT_CHECK(client,&genreSize,sizeof(int));
-							char * genre=(char*)malloc(genreSize*sizeof(char));
-							READ_CLIENT_CHECK(client,genre,genreSize);
-							genre[genreSize]='\0';
-
-							browseByGenre(dbConnect,client,genre);
-							free(genre);
-
-						}
-						else
-						if(strcmp(browseType,"author")==0){
-							int authorSize;
-							READ_CLIENT_CHECK(client,&authorSize,sizeof(int));
-							char * author=(char*)malloc(authorSize*sizeof(char));
-							READ_CLIENT_CHECK(client,author,authorSize);
-							author[authorSize]='\0';
-
-							browseByAuthor(dbConnect,client,author);
-							free(author);
-						}
-
-						free(browseType);
-						break;
-					}
-					case 3:{//SUGGEST
-						//first based on prevoius genre
-						MYSQL_RES *res_set;	
-						MYSQL_ROW row;
-						char MYSQLcommand[500];
-						sprintf(MYSQLcommand,"select fst_fav_author,scd_fav_author,fst_fav_genre,scd_fav_genre from users where id=%d;",userID);
-						mysql_query (dbConnect,MYSQLcommand);
-						res_set = mysql_store_result(dbConnect);
-						row= mysql_fetch_row(res_set);
-						string firstGenre=row[2];
-						string secondGenre=row[3];
-						string firstAuthor=row[0];
-						string secondAuthor=row[1];
-						srand(time(0));
-
-						if((double)rand() / (double)RAND_MAX  > 0.3||secondGenre.empty())
-							sprintf(MYSQLcommand,"select title,author from %s left join all_books on %s.id=all_books.id order by rand() limit 1;",firstGenre.c_str(),firstGenre.c_str());
-						else
-							sprintf(MYSQLcommand,"select title,author from %s left join all_books on %s.id=all_books.id order by rand() limit 1;",secondGenre.c_str(),secondGenre.c_str());
-						
-						suggestionDBquerys(dbConnect,client,MYSQLcommand);
-
-						if((double)rand() / (double)RAND_MAX  > 0.3||secondAuthor.empty())
-							sprintf(MYSQLcommand,"select title,author from all_books where author=\"%s\" order by rand() limit 1;",firstAuthor.c_str());
-						else
-							sprintf(MYSQLcommand,"select title,author from all_books where author=\"%s\" order by rand() limit 1;",secondAuthor.c_str());
-						
-						suggestionDBquerys(dbConnect,client,MYSQLcommand);
-
-						sprintf(MYSQLcommand,"select book_name,author_name from users left join book_owned on users.id=book_owned.id  where book_name is not null and author_name is not null and (fst_fav_author=\"%s\" or fst_fav_genre=\"%s\" or scd_fav_author=\"%s\" or scd_fav_genre=\"%s\")  and users.id != %d order by rand() limit 1;",
-							firstAuthor.c_str(),firstGenre.c_str(),firstAuthor.c_str(),firstGenre.c_str(),userID);
-						
-						suggestionDBquerys(dbConnect,client,MYSQLcommand);
-
-						
-					}
-				}
-
-
-			}
-			
-    		close (client);
-    		exit(0);
-    	}
 
     } /* while */
-	mysql_close(dbConnect);				
+	mysql_close(dbConnect);	
+
+			
 }				/* main */
